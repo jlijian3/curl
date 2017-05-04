@@ -40,7 +40,7 @@
 #include "strcase.h"
 #include "non-ascii.h" /* included for Curl_convert_... prototypes */
 #include "curl_printf.h"
-#include "rand.h"
+#include "../rand.h"
 
 /* The last #include files should be: */
 #include "curl_memory.h"

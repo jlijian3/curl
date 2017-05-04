@@ -269,6 +269,14 @@ typedef enum {
   ssl_connection_negotiating,
   ssl_connection_complete
 } ssl_connection_state;
+#ifdef TLS1_3_VERSION
+typedef enum {
+  EARLY_DATA_NONE = 0,
+  EARLY_DATA_WRITING,
+  EARLY_DATA_CONNECTING,
+  EARLY_DATA_FINISHED
+} ssl_early_data_state;
+#endif
 
 /* struct for data related to each SSL connection */
 struct ssl_connect_data {
@@ -345,6 +353,10 @@ struct ssl_connect_data {
   size_t ssl_write_buffered_length;
 #elif defined(USE_SSL)
 #error "SSL backend specific information missing from ssl_connect_data"
+#endif
+#ifdef TLS1_3_VERSION
+  size_t early_data_written; /* size of early data already written */
+  ssl_early_data_state early_data_state; /* state of writting early data */
 #endif
 };
 
@@ -1776,6 +1788,9 @@ struct UserDefined {
   struct Curl_http2_dep *stream_dependents;
 
   bool abstract_unix_socket;
+#ifdef TLS1_3_VERSION
+  bool ssl_enable_early_data;
+#endif
 };
 
 struct Names {

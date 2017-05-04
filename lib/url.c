@@ -2892,6 +2892,17 @@ CURLcode Curl_setopt(struct Curl_easy *data, CURLoption option,
   case CURLOPT_SUPPRESS_CONNECT_HEADERS:
     data->set.suppress_connect_headers = (0 != va_arg(param, long))?TRUE:FALSE;
     break;
+#ifdef USE_SSL
+#ifdef TLS1_3_VERSION
+  case CURLOPT_SSL_EARLY_DATA:
+    /*
+     * Enable TLS1.3 early data.
+     */
+    data->set.ssl_enable_early_data = (0 != va_arg(param, long)) ?
+                                       TRUE : FALSE;
+    break;
+#endif
+#endif
   default:
     /* unknown tag and its companion, just ignore: */
     result = CURLE_UNKNOWN_OPTION;

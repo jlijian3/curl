@@ -717,6 +717,8 @@ static int x509_name_oneline(X509_NAME *a, char *buf, size_t size)
 #endif
 }
 
+int ossl_conn_ex_index;
+
 /**
  * Global SSL init
  *
@@ -725,6 +727,7 @@ static int x509_name_oneline(X509_NAME *a, char *buf, size_t size)
  */
 int Curl_ossl_init(void)
 {
+  ossl_conn_ex_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
   OPENSSL_load_builtin_modules();
 
 #ifdef HAVE_ENGINE_LOAD_BUILTIN_ENGINES
@@ -1816,6 +1819,45 @@ set_ssl_version_min_max(long *ctx_options, struct connectdata *conn,
   return CURLE_OK;
 }
 
+static int ossl_new_session_cb(SSL *ssl, SSL_SESSION *new_sess)
+{
+  struct connectdata *conn = SSL_get_ex_data(ssl, ossl_conn_ex_index);
+  struct Curl_easy *data = conn->data;
+  (void)new_sess;
+
+  if(SSL_SET_OPTION(primary.sessionid)) {
+    bool incache;
+    void *old_ssl_sessionid = NULL;
+    SSL_SESSION *our_ssl_sessionid = SSL_get1_session(ssl);
+
+    Curl_ssl_sessionid_lock(conn);
+    incache = !(Curl_ssl_getsessionid(conn, &old_ssl_sessionid, NULL,
+                                      FIRSTSOCKET));
+    if(incache) {
+      if(old_ssl_sessionid != our_ssl_sessionid) {
+        infof(data, "old SSL session ID is stale, removing\n");
+        Curl_ssl_delsessionid(conn, old_ssl_sessionid);
+        incache = FALSE;
+      }
+    }
+
+    if(!incache) {
+      CURLcode result = Curl_ssl_addsessionid(conn, our_ssl_sessionid,
+                                      0 /* unknown size */, FIRSTSOCKET);
+      if(result) {
+        Curl_ssl_sessionid_unlock(conn);
+        failf(data, "failed to store ssl session");
+        return -1;
+      }
+    }
+    else{
+      SSL_SESSION_free(our_ssl_sessionid);
+    }
+    Curl_ssl_sessionid_unlock(conn);
+  }
+  return 0;
+}
+
 static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
 {
   CURLcode result = CURLE_OK;
@@ -2213,7 +2255,15 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
     failf(data, "SSL: couldn't create a context (handle)!");
     return CURLE_OUT_OF_MEMORY;
   }
-
+#ifdef TLS1_3_VERSION
+  if(data->set.ssl_enable_early_data) {
+    /*
+    SSL_CTX_set_session_cache_mode(connssl->ctx, SSL_SESS_CACHE_CLIENT);
+    */
+    SSL_CTX_sess_set_new_cb(connssl->ctx, ossl_new_session_cb);
+    SSL_set_ex_data(connssl->handle, ossl_conn_ex_index, conn);
+  }
+#endif
 #if (OPENSSL_VERSION_NUMBER >= 0x0090808fL) && !defined(OPENSSL_NO_TLSEXT) && \
     !defined(OPENSSL_NO_OCSP)
   if(SSL_CONN_CONFIG(verifystatus))
@@ -2286,6 +2336,20 @@ static CURLcode ossl_connect_step2(struct connectdata *conn, int sockindex)
               || ssl_connect_2_writing == connssl->connecting_state);
 
   ERR_clear_error();
+
+#ifdef TLS1_3_VERSION
+  /* If can write early data, SSL_write_early_data should be called first */
+  if(SSL_version(connssl->handle) >= TLS1_3_VERSION
+     && data->set.ssl_enable_early_data
+     && SSL_get0_session(connssl->handle) != NULL
+     && SSL_SESSION_get_max_early_data(
+              SSL_get0_session(connssl->handle)) > 0) {
+    connssl->connecting_state = ssl_connect_3;
+    connssl->early_data_state = EARLY_DATA_WRITING;
+    infof(data, "%s can write early data, delay ssl connecting\n", __func__);
+    return CURLE_OK;
+  }
+#endif
 
   err = SSL_connect(connssl->handle);
 
@@ -3180,11 +3244,68 @@ static ssize_t ossl_send(struct connectdata *conn,
   unsigned long sslerror;
   int memlen;
   int rc;
+#ifdef TLS1_3_VERSION
+  bool can_write_early = false;
+#endif
+  struct ssl_connect_data *connssl = &conn->ssl[sockindex];
 
   ERR_clear_error();
 
   memlen = (len > (size_t)INT_MAX) ? INT_MAX : (int)len;
-  rc = SSL_write(conn->ssl[sockindex].handle, mem, memlen);
+
+#ifdef TLS1_3_VERSION
+  if(SSL_version(connssl->handle) >= TLS1_3_VERSION
+     && conn->data->set.ssl_enable_early_data
+     && SSL_get0_session(connssl->handle) != NULL
+     && SSL_SESSION_get_max_early_data(
+              SSL_get0_session(connssl->handle)) >= (size_t)memlen) {
+    can_write_early = true;
+  }
+  else {
+    can_write_early = false;
+  }
+
+  if(can_write_early) {
+    size_t written_bytes = 0;
+
+    switch(connssl->early_data_state) {
+    case EARLY_DATA_WRITING:
+      rc = SSL_write_early_data(connssl->handle, mem, memlen, &written_bytes);
+      infof(conn->data, "SSL_write_early_data %d written %d\n",
+            rc, written_bytes);
+      if(rc != 0) {
+        connssl->early_data_written = written_bytes;
+        connssl->early_data_state = EARLY_DATA_CONNECTING;
+      }
+      else{
+        break;
+      }
+     case EARLY_DATA_CONNECTING:
+       rc = SSL_connect(connssl->handle);
+       infof(conn->data, "SSL_connect %d early_data_status %d\n",
+             rc, SSL_get_early_data_status(connssl->handle));
+       if(rc == 1) {
+         rc = (int)connssl->early_data_written;
+         connssl->early_data_state = EARLY_DATA_FINISHED;
+       }
+     case EARLY_DATA_FINISHED:
+       break;
+     default:
+       break;
+     }
+  }
+
+  if(!can_write_early
+     || ((connssl->early_data_state == EARLY_DATA_FINISHED)
+         && (SSL_get_early_data_status(connssl->handle)
+             != SSL_EARLY_DATA_ACCEPTED))) {
+#endif
+
+    rc = SSL_write(conn->ssl[sockindex].handle, mem, memlen);
+
+#ifdef TLS1_3_VERSION
+  }
+#endif
 
   if(rc <= 0) {
     err = SSL_get_error(conn->ssl[sockindex].handle, rc);
@@ -3277,6 +3398,14 @@ static ssize_t ossl_recv(struct connectdata *conn, /* connection data */
       }
     }
   }
+#ifdef TLS1_3_VERSION
+  if((SSL_version(conn->ssl[num].handle) >= TLS1_3_VERSION)
+     && conn->data->set.ssl_enable_early_data) {
+    /* TLS1.3 session ticket come later */
+    ossl_new_session_cb(conn->ssl[num].handle,
+                        SSL_get0_session(conn->ssl[num].handle));
+  }
+#endif
   return nread;
 }
 

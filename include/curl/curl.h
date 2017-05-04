@@ -1782,6 +1782,9 @@ typedef enum {
   /* Suppress proxy CONNECT response headers from user callbacks */
   CINIT(SUPPRESS_CONNECT_HEADERS, LONG, 265),
 
+  /* Support TLS1.3 0-RTT data */
+  CINIT(SSL_EARLY_DATA, LONG, 266),
+
   CURLOPT_LASTENTRY /* the last unused */
 } CURLoption;
 
