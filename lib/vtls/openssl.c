@@ -3295,6 +3295,7 @@ static ssize_t ossl_send(struct connectdata *conn,
 
   if(can_write_early) {
     size_t written_bytes = 0;
+    int rest = (int)max_early_data - (int)connssl->early_data_written;
 
     if(SSL_is_init_finished(connssl->handle)) {
       connssl->early_data_state = EARLY_DATA_FINISHED;
@@ -3302,10 +3303,12 @@ static ssize_t ossl_send(struct connectdata *conn,
 
     switch(connssl->early_data_state) {
     case EARLY_DATA_WRITING:
-      if((connssl->early_data_written + (size_t)memlen) > max_early_data) {
+      if(rest <= 0) {
         connssl->early_data_state = EARLY_DATA_CONNECTING;
       }
       else {
+        if(memlen > rest)
+            memlen = rest;
         rc = SSL_write_early_data(connssl->handle, mem, memlen,
                                   &written_bytes);
         infof(conn->data, "SSL_write_early_data %d written %d\n",
