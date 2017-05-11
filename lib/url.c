@@ -604,6 +604,9 @@ CURLcode Curl_init_userdefined(struct UserDefined *set)
 
   set->ssl_enable_npn = TRUE;
   set->ssl_enable_alpn = TRUE;
+#ifdef TLS1_3_VERSION
+  set->ssl_enable_early_data = FALSE;
+#endif
 
   set->expect_100_timeout = 1000L; /* Wait for a second by default. */
   set->sep_headers = TRUE; /* separated header lists by default */

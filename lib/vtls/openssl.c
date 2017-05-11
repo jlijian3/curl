@@ -1855,6 +1855,7 @@ static int ossl_new_session_cb(SSL *ssl, SSL_SESSION *new_sess)
     }
     Curl_ssl_sessionid_unlock(conn);
   }
+
   return 0;
 }
 
@@ -1941,7 +1942,11 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
     if(ssl_authtype == CURL_TLSAUTH_SRP)
       return CURLE_SSL_CONNECT_ERROR;
 #endif
+#if OPENSSL_VERSION_NUMBER < 0x10101000L
     req_method = SSLv3_client_method();
+#else
+    req_method = TLS_client_method();
+#endif
     use_sni(FALSE);
     break;
 #endif
@@ -2262,7 +2267,12 @@ static CURLcode ossl_connect_step1(struct connectdata *conn, int sockindex)
     */
     SSL_CTX_sess_set_new_cb(connssl->ctx, ossl_new_session_cb);
     SSL_set_ex_data(connssl->handle, ossl_conn_ex_index, conn);
+#ifdef OPENSSL_IS_BORINGSSL
+    SSL_set_early_data_enabled(connssl->handle, 1);
+#endif
   }
+  connssl->early_data_state = EARLY_DATA_NONE;
+  connssl->early_data_written = 0;
 #endif
 #if (OPENSSL_VERSION_NUMBER >= 0x0090808fL) && !defined(OPENSSL_NO_TLSEXT) && \
     !defined(OPENSSL_NO_OCSP)
@@ -2331,26 +2341,36 @@ static CURLcode ossl_connect_step2(struct connectdata *conn, int sockindex)
   struct ssl_connect_data *connssl = &conn->ssl[sockindex];
   long * const certverifyresult = SSL_IS_PROXY() ?
     &data->set.proxy_ssl.certverifyresult : &data->set.ssl.certverifyresult;
+#ifdef TLS1_3_VERSION
+  SSL_SESSION *session = SSL_get1_session(connssl->handle);
+#endif
   DEBUGASSERT(ssl_connect_2 == connssl->connecting_state
               || ssl_connect_2_reading == connssl->connecting_state
               || ssl_connect_2_writing == connssl->connecting_state);
 
   ERR_clear_error();
 
-#ifdef TLS1_3_VERSION
+#if defined(TLS1_3_VERSION) && !defined(OPENSSL_IS_BORINGSSL)
   /* If can write early data, SSL_write_early_data should be called first */
   if(SSL_version(connssl->handle) >= TLS1_3_VERSION
      && data->set.ssl_enable_early_data
-     && SSL_get0_session(connssl->handle) != NULL
-     && SSL_SESSION_get_max_early_data(
-              SSL_get0_session(connssl->handle)) > 0) {
+     && session != NULL
+     && SSL_SESSION_get_max_early_data(session) > 0) {
     connssl->connecting_state = ssl_connect_3;
     connssl->early_data_state = EARLY_DATA_WRITING;
     infof(data, "%s can write early data, delay ssl connecting\n", __func__);
+    /*
     return CURLE_OK;
+    */
+    err = 1;
   }
-#endif
+  else{
+    connssl->early_data_state = EARLY_DATA_NONE;
+  }
+  SSL_SESSION_free(session);
 
+  if(connssl->early_data_state == EARLY_DATA_NONE)
+#endif
   err = SSL_connect(connssl->handle);
 
   /* 1  is fine
@@ -3244,8 +3264,10 @@ static ssize_t ossl_send(struct connectdata *conn,
   unsigned long sslerror;
   int memlen;
   int rc;
-#ifdef TLS1_3_VERSION
+#if defined(TLS1_3_VERSION) && !defined(OPENSSL_IS_BORINGSSL)
   bool can_write_early = false;
+  SSL_SESSION *session = NULL;
+  size_t max_early_data = 0;
 #endif
   struct ssl_connect_data *connssl = &conn->ssl[sockindex];
 
@@ -3253,31 +3275,51 @@ static ssize_t ossl_send(struct connectdata *conn,
 
   memlen = (len > (size_t)INT_MAX) ? INT_MAX : (int)len;
 
-#ifdef TLS1_3_VERSION
+#if defined(TLS1_3_VERSION) && !defined(OPENSSL_IS_BORINGSSL)
+  session = SSL_get1_session(connssl->handle);
+  if(session)
+    max_early_data = SSL_SESSION_get_max_early_data(session);
+
   if(SSL_version(connssl->handle) >= TLS1_3_VERSION
      && conn->data->set.ssl_enable_early_data
-     && SSL_get0_session(connssl->handle) != NULL
-     && SSL_SESSION_get_max_early_data(
-              SSL_get0_session(connssl->handle)) >= (size_t)memlen) {
+     && session != NULL
+     && max_early_data > 0) {
     can_write_early = true;
   }
   else {
     can_write_early = false;
+    connssl->early_data_state = EARLY_DATA_NONE;
   }
+
+  SSL_SESSION_free(session);
 
   if(can_write_early) {
     size_t written_bytes = 0;
 
+    if(SSL_is_init_finished(connssl->handle)) {
+      connssl->early_data_state = EARLY_DATA_FINISHED;
+    }
+
     switch(connssl->early_data_state) {
     case EARLY_DATA_WRITING:
-      rc = SSL_write_early_data(connssl->handle, mem, memlen, &written_bytes);
-      infof(conn->data, "SSL_write_early_data %d written %d\n",
-            rc, written_bytes);
-      if(rc != 0) {
-        connssl->early_data_written = written_bytes;
+      if((connssl->early_data_written + (size_t)memlen) > max_early_data) {
         connssl->early_data_state = EARLY_DATA_CONNECTING;
       }
-      else{
+      else {
+        rc = SSL_write_early_data(connssl->handle, mem, memlen,
+                                  &written_bytes);
+        infof(conn->data, "SSL_write_early_data %d written %d\n",
+              rc, written_bytes);
+
+        if(rc != 0) {
+          connssl->early_data_written += written_bytes;
+          /*
+          connssl->early_data_state = EARLY_DATA_CONNECTING;
+          */
+          *curlcode = CURLE_OK;
+          return written_bytes;
+        }
+
         break;
       }
      case EARLY_DATA_CONNECTING:
@@ -3285,7 +3327,6 @@ static ssize_t ossl_send(struct connectdata *conn,
        infof(conn->data, "SSL_connect %d early_data_status %d\n",
              rc, SSL_get_early_data_status(connssl->handle));
        if(rc == 1) {
-         rc = (int)connssl->early_data_written;
          connssl->early_data_state = EARLY_DATA_FINISHED;
        }
      case EARLY_DATA_FINISHED:
@@ -3296,14 +3337,11 @@ static ssize_t ossl_send(struct connectdata *conn,
   }
 
   if(!can_write_early
-     || ((connssl->early_data_state == EARLY_DATA_FINISHED)
-         && (SSL_get_early_data_status(connssl->handle)
-             != SSL_EARLY_DATA_ACCEPTED))) {
+     || (connssl->early_data_state != EARLY_DATA_WRITING)) {
 #endif
-
     rc = SSL_write(conn->ssl[sockindex].handle, mem, memlen);
-
-#ifdef TLS1_3_VERSION
+    infof(conn->data, "SSL_write %d\n", rc);
+#if defined(TLS1_3_VERSION) && !defined(OPENSSL_IS_BORINGSSL)
   }
 #endif
 
@@ -3367,6 +3405,7 @@ static ssize_t ossl_recv(struct connectdata *conn, /* connection data */
 
   buffsize = (buffersize > (size_t)INT_MAX) ? INT_MAX : (int)buffersize;
   nread = (ssize_t)SSL_read(conn->ssl[num].handle, buf, buffsize);
+  infof(conn->data, "SSL_read %d\n", nread);
   if(nread <= 0) {
     /* failed SSL_read */
     int err = SSL_get_error(conn->ssl[num].handle, (int)nread);
@@ -3402,8 +3441,7 @@ static ssize_t ossl_recv(struct connectdata *conn, /* connection data */
   if((SSL_version(conn->ssl[num].handle) >= TLS1_3_VERSION)
      && conn->data->set.ssl_enable_early_data) {
     /* TLS1.3 session ticket come later */
-    ossl_new_session_cb(conn->ssl[num].handle,
-                        SSL_get0_session(conn->ssl[num].handle));
+    ossl_new_session_cb(conn->ssl[num].handle, NULL);
   }
 #endif
   return nread;
