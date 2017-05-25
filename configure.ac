@@ -1510,13 +1510,13 @@ if test "$curl_ssl_msg" = "$init_ssl_msg" && test X"$OPT_SSL" != Xno; then
 
   AC_CHECK_LIB(crypto, HMAC_Update,[
      HAVECRYPTO="yes"
-     LIBS="-lcrypto $LIBS"
+     LIBS="-lcrypto -lpthread $LIBS"
      ],[
      LDFLAGS="$CLEANLDFLAGS -L$LIB_OPENSSL"
      CPPFLAGS="$CLEANCPPFLAGS -I$PREFIX_OPENSSL/include/openssl -I$PREFIX_OPENSSL/include"
      AC_CHECK_LIB(crypto, HMAC_Init_ex,[
        HAVECRYPTO="yes"
-       LIBS="-lcrypto $LIBS"], [
+       LIBS="-lcrypto -lpthread $LIBS"], [
        LDFLAGS="$CLEANLDFLAGS"
        CPPFLAGS="$CLEANCPPFLAGS"
        LIBS="$CLEANLIBS"
